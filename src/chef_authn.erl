@@ -143,6 +143,38 @@ sig_to_list(Sig, N, Acc) ->
             sig_to_list(Rest, N, [Line|Acc])
     end.
 
+authenticate_user_request(Headers, Method, Path, Body, UserKey, TimeSkew) ->
+    % Mod is the Module to use to acces Headers.  Not sure if this
+    % over-complicates, but wanted to not tie too closely with
+    % webmachine/mochiweb.
+    %
+    % signing description valid
+    % obtain request signature from X-Ops-Authorization-1..N
+    % decrypt request signature => plain_block
+    % compute candidate_block via canonicalize_request
+    % compare candidate (sent) with plain_block
+    % time in bounds
+    % verify hashed body header matches a hash of the body
+    % ERROR if any required header is missing
+    % return {name, UserId} if sigs match, time ok, and hashes match.  Else no_authn.
+    ok.
+
+decrypt_sig(Sig, PublicKey) ->
+    {'RSAPublicKey', Der, _} = hd(public_key:pem_decode(PublicKey)),
+    RSAKey = public_key:der_decode('RSAPublicKey', Der),
+    public_key:decrypt_public(base64:decode(Sig), RSAKey).
+
+sig_from_headers({Mod, Headers}, I, Acc) ->
+    Header = xops_header(I),
+    case Mod:get_primary_value(Header, Headers) of
+        undefined ->
+            iolist_to_binary(lists:reverse(Acc));
+        Part ->
+            sig_from_headers({Mod, Headers}, I+1, [Part|Acc])
+    end.
+
+time_in_bounds(T1, T2, Skew) ->
+    false.
 
 -ifdef(TEST).
 
@@ -194,8 +226,6 @@ sign_request_test() ->
          <<"utju9jzczCyB+sSAQWrxSsXB/b8vV2qs0l4VD2ML+w==">>
         ],
 
-    % # We expect Mixlib::Authentication::SignedHeaderAuth#sign to return this
-    % # if passed the BODY above.
     AuthLine = fun(I) -> lists:nth(I, X_OPS_AUTHORIZATION_LINES) end,
     EXPECTED_SIGN_RESULT =
         [
@@ -213,7 +243,9 @@ sign_request_test() ->
     Time = "Thu, 01 Jan 2009 12:00:00 GMT",
     Sig = sign_request(PRIVATE_KEY, <<"Spec Body">>, <<"spec-user">>, <<"post">>,
                        Time, <<"/organizations/clownco">>),
-    ?assertEqual(EXPECTED_SIGN_RESULT, Sig).
-
+    ?assertEqual(EXPECTED_SIGN_RESULT, Sig),
+    AuthSig = iolist_to_binary(X_OPS_AUTHORIZATION_LINES),
+    {ok, PUBLIC_KEY} = file:read_file("../test/public_key"),    
+    ?debugVal(decrypt_sig(AuthSig, PUBLIC_KEY)).
 
 -endif.

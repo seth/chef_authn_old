@@ -20,20 +20,27 @@
 -define(buf_size, 16384).
 
 -compile([export_all]).
-% -export([hash_string/1,
-%          hash_file/1
-%         ]).
+
+-type(http_body() :: binary() | pid()).
+-type(user_id() :: binary()).
+-type(http_method() :: binary()).
+-type(http_time() :: binary()).
+-type(http_path() :: binary()).
+-type(sha_hash64() || binary()).
+-type(erlang_time() :: {calendar:date(), calendar:time()}).
+-type(private_key() :: binary()).
+-type(public_key() :: binary()).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -endif.
 
--spec(hash_string(string()|binary()) -> binary()).
+-spec(hash_string(string()|binary()) -> sha_hash64()).
 %% @doc Base 64 encoded SHA1 of `Str'
 hash_string(Str) ->
     base64:encode(crypto:sha(Str)).
 
--spec(hash_file(file:io_device()) -> binary()).
+-spec(hash_file(file:io_device()) -> sha_hash64()).
 %% @doc Base 64 encoded SHA1 of contents of `F'
 hash_file(F) ->
     hash_file(F, crypto:sha_init()).
@@ -49,7 +56,6 @@ hash_file(F, Ctx) ->
 
 
 -spec(time_iso8601({calendar:date(), calendar:time()} | now) -> binary()).
-
 %% @doc Converts Erlang time-tuple to iso8601 formatted date string.
 %%
 %% Example output looks like <<"2003-12-13T18:30:02Z">>
@@ -62,8 +68,7 @@ time_iso8601({{Year, Month, Day}, {Hour, Min, Sec}}) ->
                                                [Year, Month, Day,
                                                 Hour, Min, Sec]))).
 
--spec(time_iso8601_to_date_time(string()|binary()) -> {calendar:date(), calendar:time()}).
-
+-spec(time_iso8601_to_date_time(string()|binary()) -> erlang_time()).
 %% @doc Convert an iso8601 time string to Erlang date time
 %% representation.
 time_iso8601_to_date_time(ATime) when is_binary(ATime) ->
@@ -73,20 +78,29 @@ time_iso8601_to_date_time(ATime) ->
         [ list_to_integer(S) || S <- string:tokens(ATime, "-T:Z") ],
     {{Year, Month, Day}, {Hour, Min, Sec}}.
 
-canonical_time(T) ->
+-spec(canonical_time(string() | binary()) -> binary()).
+%% @doc Convert a string or binary HTTP request time to iso8601 format
+canonical_time(T) when is_binary(T) ->
+    canonical_time(binary_to_list(T));
+canonical_time(T) when is_list(T) ->
     time_iso8601(httpd_util:convert_request_date(T)).
 
-
+%% @doc Canonicalize an HTTP request path by removing doubled slashes
+%% and trailing slash (except for case of root path).
 canonical_path(Path = <<"/">>) ->
     Path;
 canonical_path(Path) ->
     NoDoubles = re:replace(Path, "/+/", <<"/">>, [{return, binary}, global]),
     re:replace(NoDoubles, "/$", % fix emacs erlang-mode: "
-               <<"/">>, [{return, binary}]).
+               "", [{return, binary}]).
 
+%% @doc Canonicalize HTTP method as all uppercase binary
 canonical_method(Method) ->
     list_to_binary(string:to_upper(binary_to_list(Method))).
 
+-spec(hashed_body(binary() | pid()) -> binary()).
+%% @doc Return the SHA1 hash of the body which can either be a binary
+%% or the pid of a file.
 hashed_body(Body) when is_pid(Body) ->
     hash_file(Body);
 hashed_body(Body) when is_binary(Body) ->
@@ -94,12 +108,10 @@ hashed_body(Body) when is_binary(Body) ->
 hashed_body(Body) when is_list(Body) ->
     hashed_body(iolist_to_binary(Body)).
 
-% so signedheaderauth seems to be implemented where you pass in an
-% args hash with body, user_id, http_method, timestamp, file, and
-% path.  These are then accessed as instance methods to do the
-% authentication.  So we could either take a similar approach or just
-% have a proplist be an input to the entry point functions.
-
+-spec(canonicalize_request(http_body(), user_id(), http_method(),
+                           http_time(), http_path()) -> binary()).
+%% @doc Canonicalize an HTTP request into a binary that can be signed
+%% for verification.
 canonicalize_request(Body, UserId, Method, Time, Path) ->
     Format = <<"Method:~s\nHashed Path:~s\nX-Ops-Content-Hash:~s\nX-Ops-Timestamp:~s\nX-Ops-UserId:~ts">>,
     iolist_to_binary(io_lib:format(Format, [canonical_method(Method),
@@ -108,6 +120,13 @@ canonicalize_request(Body, UserId, Method, Time, Path) ->
                                             canonical_time(Time),
                                             UserId])).
 
+-spec(sign_request(private_key(), http_body(), user_id(),
+                   http_method(), http_time(),
+                   http_path()) -> [{binary(), binary()}]).
+%% @doc Sign an HTTP request so it can be sent to a Chef server.
+%%
+%% Returns a list of header tuples that should be included in the
+%% final HTTP request.
 sign_request(PrivateKey, Body, User, Method, Time, Path) ->
     {'RSAPrivateKey', Der, _} = hd(public_key:pem_decode(PrivateKey)),
     RSAKey = public_key:der_decode('RSAPrivateKey', Der),
@@ -143,26 +162,53 @@ sig_to_list(Sig, N, Acc) ->
             sig_to_list(Rest, N, [Line|Acc])
     end.
 
-authenticate_user_request(Headers, Method, Path, Body, UserKey, TimeSkew) ->
+-spec(authenticate_user_request(
+        http_headers(),
+        http_method(),
+        http_path(),
+        http_body(),
+        public_key(),
+        integer()
+       ) -> {name, user_id()} | no_authn).
+%% @doc 
+authenticate_user_request({Mod, Headers}, Method, Path, Body, UserKey, TimeSkew) ->
     % Mod is the Module to use to acces Headers.  Not sure if this
     % over-complicates, but wanted to not tie too closely with
-    % webmachine/mochiweb.
+    % webmachine/mochiweb.  Mod must provide a get_primary_value/2
+    % function taking HeaderName and Headers.  This function should
+    % return the header value or 'underfined'.
     %
     % signing description valid
+    
     % obtain request signature from X-Ops-Authorization-1..N
     % decrypt request signature => plain_block
+    Decrypted = decrypt_sig(AuthSig, UserKey),
     % compute candidate_block via canonicalize_request
+    % Plain = canonicalize_request(...),
     % compare candidate (sent) with plain_block
+    % try Decrypted = Plain
     % time in bounds
     % verify hashed body header matches a hash of the body
     % ERROR if any required header is missing
     % return {name, UserId} if sigs match, time ok, and hashes match.  Else no_authn.
     ok.
 
+read_rsa_public_key(Key) ->
+    Bin = erlang:iolist_to_binary(public_key_lines(re:split(Key, "\n"), [])),
+    Spki = public_key:der_decode('SubjectPublicKeyInfo', base64:mime_decode(Bin)),
+    {_, _, {0, KeyDer}} = Spki,
+    public_key:der_decode('RSAPublicKey', KeyDer).
+
+public_key_lines([<<"-----BEGIN PUBLIC KEY-----">>|Rest], Acc) ->
+    public_key_lines(Rest, Acc);
+public_key_lines([<<"-----END PUBLIC KEY-----">>|Rest], Acc) ->
+    lists:reverse(Acc);
+public_key_lines([Line|Rest], Acc) ->
+    public_key_lines(Rest, [Line|Acc]).
+    
 decrypt_sig(Sig, PublicKey) ->
-    {'RSAPublicKey', Der, _} = hd(public_key:pem_decode(PublicKey)),
-    RSAKey = public_key:der_decode('RSAPublicKey', Der),
-    public_key:decrypt_public(base64:decode(Sig), RSAKey).
+    PK = read_rsa_public_key(PublicKey),
+    public_key:decrypt_public(base64:decode(Sig), PK).
 
 sig_from_headers({Mod, Headers}, I, Acc) ->
     Header = xops_header(I),
@@ -173,8 +219,13 @@ sig_from_headers({Mod, Headers}, I, Acc) ->
             sig_from_headers({Mod, Headers}, I+1, [Part|Acc])
     end.
 
+time_in_bounds(T1, T2, Skew) when is_binary(T1); is_binary(T2) ->
+    time_in_bounds(time_iso8601_to_date_time(T1),
+                   time_iso8601_to_date_time(T2), Skew);
 time_in_bounds(T1, T2, Skew) ->
-    false.
+    S1 = calendar:datetime_to_gregorian_seconds(T1),
+    S2 = calendar:datetime_to_gregorian_seconds(T2),
+    (S2 - S1) < Skew.
 
 -ifdef(TEST).
 
@@ -245,7 +296,20 @@ sign_request_test() ->
                        Time, <<"/organizations/clownco">>),
     ?assertEqual(EXPECTED_SIGN_RESULT, Sig),
     AuthSig = iolist_to_binary(X_OPS_AUTHORIZATION_LINES),
-    {ok, PUBLIC_KEY} = file:read_file("../test/public_key"),    
-    ?debugVal(decrypt_sig(AuthSig, PUBLIC_KEY)).
+    {ok, PUBLIC_KEY} = file:read_file("../test/public_key"),
+        Time = "Thu, 01 Jan 2009 12:00:00 GMT",
+    Time8601 = "2009-01-01T12:00:00Z",
+    User = "spec-user",
+    Hashed_body = "DFteJZPVv6WKdQmMqZUQUumUyRs=",
+    Hashed_path = "YtBWDn1blGGuFIuKksdwXzHU9oE=",
+
+    Expected_sign_string = iolist_to_binary(io_lib:format(
+                                              "Method:~s\nHashed Path:~s\n"
+                                              "X-Ops-Content-Hash:~s\n"
+                                              "X-Ops-Timestamp:~s\n"
+                                              "X-Ops-UserId:~s",
+                                              ["POST", Hashed_path, Hashed_body,
+                                               Time8601, User])),
+    ?assertEqual(Expected_sign_string, decrypt_sig(AuthSig, PUBLIC_KEY)).
 
 -endif.

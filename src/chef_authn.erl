@@ -26,7 +26,7 @@
 -type(http_method() :: binary()).
 -type(http_time() :: binary()).
 -type(http_path() :: binary()).
--type(sha_hash64() || binary()).
+-type(sha_hash64() :: binary()).
 -type(erlang_time() :: {calendar:date(), calendar:time()}).
 -type(private_key() :: binary()).
 -type(public_key() :: binary()).
@@ -163,7 +163,7 @@ sig_to_list(Sig, N, Acc) ->
     end.
 
 -spec(authenticate_user_request(
-        http_headers(),
+        fun((binary()) -> binary()),
         http_method(),
         http_path(),
         http_body(),
@@ -171,27 +171,52 @@ sig_to_list(Sig, N, Acc) ->
         integer()
        ) -> {name, user_id()} | no_authn).
 %% @doc 
-authenticate_user_request({Mod, Headers}, Method, Path, Body, UserKey, TimeSkew) ->
-    % Mod is the Module to use to acces Headers.  Not sure if this
-    % over-complicates, but wanted to not tie too closely with
-    % webmachine/mochiweb.  Mod must provide a get_primary_value/2
-    % function taking HeaderName and Headers.  This function should
-    % return the header value or 'underfined'.
-    %
-    % signing description valid
-    
-    % obtain request signature from X-Ops-Authorization-1..N
-    % decrypt request signature => plain_block
+authenticate_user_request(GetHeader, Method, Path, Body, UserKey, TimeSkew) ->
+
+    % GetHeader is a fun/1 such that GetHeader(binary(), Headers)
+    % returns the value for the header or undefined.
+
+    UserId = GetHeader(<<"X-Ops-UserId">>),
+    ReqTime = GetHeader(<<"X-Ops-Timestamp">>),
+    AuthSig = sig_from_headers(GetHeader, 1, []),
     Decrypted = decrypt_sig(AuthSig, UserKey),
-    % compute candidate_block via canonicalize_request
-    % Plain = canonicalize_request(...),
-    % compare candidate (sent) with plain_block
-    % try Decrypted = Plain
-    % time in bounds
-    % verify hashed body header matches a hash of the body
-    % ERROR if any required header is missing
-    % return {name, UserId} if sigs match, time ok, and hashes match.  Else no_authn.
-    ok.
+    Plain = canonicalize_request(Body, UserId, Method, ReqTime, Path),
+    SigMatched = try
+                     Decrypted = Plain,
+                     true
+                 catch
+                     error:{badmatch, _} ->
+                         false
+                 end,
+    TimeInBounds = time_in_bounds(ReqTime, TimeSkew),
+    case SigMatched andalso TimeInBounds of
+        true ->
+            {name, UserId};
+        false ->
+            no_authn
+    end.
+
+decrypt_sig(Sig, PublicKey) ->
+    PK = read_rsa_public_key(PublicKey),
+    public_key:decrypt_public(base64:decode(Sig), PK).
+
+sig_from_headers(GetHeader, I, Acc) ->
+    Header = xops_header(I),
+    case GetHeader(Header) of
+        undefined ->
+            iolist_to_binary(lists:reverse(Acc));
+        Part ->
+            sig_from_headers(GetHeader, I+1, [Part|Acc])
+    end.
+
+time_in_bounds(ReqTime, Skew) ->
+    Now = calendar:now_to_universal_time(erlang:now()),
+    time_in_bounds(time_iso8601_to_date_time(ReqTime), Now, Skew).
+
+time_in_bounds(T1, T2, Skew) ->
+    S1 = calendar:datetime_to_gregorian_seconds(T1),
+    S2 = calendar:datetime_to_gregorian_seconds(T2),
+    (S2 - S1) < Skew.
 
 read_rsa_public_key(Key) ->
     Bin = erlang:iolist_to_binary(public_key_lines(re:split(Key, "\n"), [])),
@@ -201,31 +226,10 @@ read_rsa_public_key(Key) ->
 
 public_key_lines([<<"-----BEGIN PUBLIC KEY-----">>|Rest], Acc) ->
     public_key_lines(Rest, Acc);
-public_key_lines([<<"-----END PUBLIC KEY-----">>|Rest], Acc) ->
+public_key_lines([<<"-----END PUBLIC KEY-----">>|_Rest], Acc) ->
     lists:reverse(Acc);
 public_key_lines([Line|Rest], Acc) ->
     public_key_lines(Rest, [Line|Acc]).
-    
-decrypt_sig(Sig, PublicKey) ->
-    PK = read_rsa_public_key(PublicKey),
-    public_key:decrypt_public(base64:decode(Sig), PK).
-
-sig_from_headers({Mod, Headers}, I, Acc) ->
-    Header = xops_header(I),
-    case Mod:get_primary_value(Header, Headers) of
-        undefined ->
-            iolist_to_binary(lists:reverse(Acc));
-        Part ->
-            sig_from_headers({Mod, Headers}, I+1, [Part|Acc])
-    end.
-
-time_in_bounds(T1, T2, Skew) when is_binary(T1); is_binary(T2) ->
-    time_in_bounds(time_iso8601_to_date_time(T1),
-                   time_iso8601_to_date_time(T2), Skew);
-time_in_bounds(T1, T2, Skew) ->
-    S1 = calendar:datetime_to_gregorian_seconds(T1),
-    S2 = calendar:datetime_to_gregorian_seconds(T2),
-    (S2 - S1) < Skew.
 
 -ifdef(TEST).
 

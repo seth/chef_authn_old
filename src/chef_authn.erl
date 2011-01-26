@@ -18,6 +18,8 @@
 %
 
 -define(buf_size, 16384).
+-define(signing_version, <<"1.0">>).
+-define(signing_version_key, <<"version">>).
 
 -export([
          hash_string/1,
@@ -212,12 +214,15 @@ sig_to_list(Sig, N, Acc) ->
 authenticate_user_request(GetHeader, Method, Path, Body, PublicKey, TimeSkew) ->
     UserId = GetHeader(<<"X-Ops-UserId">>),
     ReqTime = GetHeader(<<"X-Ops-Timestamp">>),
+    SignDesc = parse_signing_description(GetHeader(<<"X-Ops-Sign">>)),
+    SignVersion = proplists:get_value(?signing_version_key, SignDesc),
     AuthSig = sig_from_headers(GetHeader, 1, []),
     Decrypted = decrypt_sig(AuthSig, PublicKey),
     Plain = canonicalize_request(hashed_body(Body), UserId, Method, ReqTime,
                                  Path),
     SigMatched = try
                      Decrypted = Plain,
+                     ?signing_version = SignVersion,
                      true
                  catch
                      error:{badmatch, _} ->
@@ -260,6 +265,12 @@ time_in_bounds(T1, T2, Skew) ->
     S1 = calendar:datetime_to_gregorian_seconds(T1),
     S2 = calendar:datetime_to_gregorian_seconds(T2),
     (S2 - S1) < Skew.
+
+parse_signing_description(undefined) ->
+    [];
+parse_signing_description(Desc) ->
+    [ {Key, Value} ||
+        [Key, Value] <- [ re:split(KV, "=") || KV <- re:split(Desc, ";") ] ].
 
 % --
 %% at some point, the functions in the public_key module should be
@@ -487,10 +498,36 @@ authenticate_user_request_test_() ->
                            authenticate_user_request(GetHeader2, <<"post">>, ?path,
                                                      ?body, Public_key, TimeSkew))
       end
+     },
+
+     {"no_authn: mismatched signing description",
+      fun() ->
+              Headers2 = lists:keyreplace(<<"X-Ops-Sign">>, 1, Headers,
+                                          {<<"X-Ops-Sign">>, <<"version=2.0">>}),
+              GetHeader2 = fun(X) -> proplists:get_value(X, Headers2) end,
+              ?assertEqual(no_authn,
+                           authenticate_user_request(GetHeader2, <<"post">>, ?path,
+                                                     ?body, Public_key, TimeSkew))
+      end
+     },
+
+     {"no_authn: missing signing description",
+      fun() ->
+              Headers2 = lists:keydelete(<<"X-Ops-Sign">>, 1, Headers),
+              GetHeader2 = fun(X) -> proplists:get_value(X, Headers2) end,
+              ?assertEqual(no_authn,
+                           authenticate_user_request(GetHeader2, <<"post">>, ?path,
+                                                     ?body, Public_key, TimeSkew))
+      end
      }
 
-
-
      ].
+
+parse_signing_description_test_() ->
+    Cases = [{<<"version=1.0">>, [{<<"version">>, <<"1.0">>}]},
+             {undefined, []},
+             {<<"a=1;b=2">>, [{<<"a">>, <<"1">>}, {<<"b">>, <<"2">>}]}],
+    [ ?_assertEqual(Want, parse_signing_description(In))
+      || {In, Want} <- Cases ].
 
 -endif.

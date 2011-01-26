@@ -1,0 +1,4 @@
+* chef_authn, an Erlang port of Chef's mixlib-authentication
+** Making RSA keys with openssl
+: openssl genrsa -out akey.pem 1024
+: openssl rsa -in akey.pem -pubout > akey_public.pem

@@ -117,7 +117,8 @@ canonicalize_request(Body, UserId, Method, Time, Path) ->
     iolist_to_binary(io_lib:format(Format, [canonical_method(Method),
                                             hash_string(canonical_path(Path)),
                                             hashed_body(Body),
-                                            canonical_time(Time),
+                                            %canonical_time(Time),
+                                            Time,
                                             UserId])).
 
 -spec(sign_request(private_key(), http_body(), user_id(),
@@ -130,14 +131,14 @@ canonicalize_request(Body, UserId, Method, Time, Path) ->
 sign_request(PrivateKey, Body, User, Method, Time, Path) ->
     {'RSAPrivateKey', Der, _} = hd(public_key:pem_decode(PrivateKey)),
     RSAKey = public_key:der_decode('RSAPrivateKey', Der),
-    SignThis = canonicalize_request(Body, User, Method, Time, Path),
+    CTime = canonical_time(Time),
+    SignThis = canonicalize_request(Body, User, Method, CTime, Path),
     Sig = base64:encode(public_key:encrypt_private(SignThis, RSAKey)),
     % FIXME: should only call hashed_body once
     [{<<"X-Ops-Content-Hash">>, hashed_body(Body)},
-     {<<"X-Ops-Userid">>, User},
+     {<<"X-Ops-UserId">>, User},
      {<<"X-Ops-Sign">>, <<"version=1.0">>},
-     % FIXME: should only call canonical_time once
-     {<<"X-Ops-Timestamp">>, canonical_time(Time)}]
+     {<<"X-Ops-Timestamp">>, CTime}]
        ++ sig_header_items(Sig).
 
 xops_header(I) ->
@@ -196,9 +197,15 @@ authenticate_user_request(GetHeader, Method, Path, Body, UserKey, TimeSkew) ->
             no_authn
     end.
 
+-spec(decrypt_sig(binary(), binary()) -> binary() | decrypt_failed).
 decrypt_sig(Sig, PublicKey) ->
     PK = read_rsa_public_key(PublicKey),
-    public_key:decrypt_public(base64:decode(Sig), PK).
+    try
+        public_key:decrypt_public(base64:decode(Sig), PK)
+    catch
+        error:decrypt_failed ->
+            decrypt_failed
+    end.
 
 sig_from_headers(GetHeader, I, Acc) ->
     Header = xops_header(I),
@@ -233,45 +240,16 @@ public_key_lines([Line|Rest], Acc) ->
 
 -ifdef(TEST).
 
-hashed_path_test() ->
-    Path = "/organizations/clownco",
-    Hashed_path = <<"YtBWDn1blGGuFIuKksdwXzHU9oE=">>,
-    ?assertEqual(Hashed_path, hash_string(canonical_path(Path))).
+-define(path, <<"/organizations/clownco">>).
+-define(hashed_path, <<"YtBWDn1blGGuFIuKksdwXzHU9oE=">>).
 
-hashed_body_test() ->
-    Body = "Spec Body",
-    Hashed_body = <<"DFteJZPVv6WKdQmMqZUQUumUyRs=">>,
-    ?assertEqual(Hashed_body, hashed_body(Body)).
+-define(body, <<"Spec Body">>).
+-define(hashed_body, <<"DFteJZPVv6WKdQmMqZUQUumUyRs=">>).
+-define(request_time_http, <<"Thu, 01 Jan 2009 12:00:00 GMT">>).
+-define(request_time_iso8601, <<"2009-01-01T12:00:00Z">>).
+-define(user, <<"spec-user">>).
 
-canonical_time_test() ->
-    % This date format comes from Ruby's default printing,
-    % but doesn't correspond to the HTTP rfc2616 format
-    % Time = "Thu Jan 01 12:00:00 -0000 2009",
-    Time = "Thu, 01 Jan 2009 12:00:00 GMT",
-    Time8601 = <<"2009-01-01T12:00:00Z">>,
-    ?assertEqual(Time8601, canonical_time(Time)).
-    
-canonicalize_request_test() ->
-    Time = "Thu, 01 Jan 2009 12:00:00 GMT",
-    Time8601 = "2009-01-01T12:00:00Z",
-    User = "spec-user",
-    Hashed_body = "DFteJZPVv6WKdQmMqZUQUumUyRs=",
-    Hashed_path = "YtBWDn1blGGuFIuKksdwXzHU9oE=",
-    Expected_sign_string = iolist_to_binary(io_lib:format(
-                                              "Method:~s\nHashed Path:~s\n"
-                                              "X-Ops-Content-Hash:~s\n"
-                                              "X-Ops-Timestamp:~s\n"
-                                              "X-Ops-UserId:~s",
-                                              ["POST", Hashed_path, Hashed_body,
-                                               Time8601, User])),
-    Val = canonicalize_request(<<"Spec Body">>, <<"spec-user">>, <<"post">>,
-                               Time, <<"/organizations/clownco">>),
-    ?assertEqual(Expected_sign_string, Val).
-
-sign_request_test() ->
-    {ok, PRIVATE_KEY} = file:read_file("../test/private_key"),
-    X_OPS_CONTENT_HASH = <<"DFteJZPVv6WKdQmMqZUQUumUyRs=">>,
-    X_OPS_AUTHORIZATION_LINES =
+-define(X_OPS_AUTHORIZATION_LINES,
         [
          <<"jVHrNniWzpbez/eGWjFnO6lINRIuKOg40ZTIQudcFe47Z9e/HvrszfVXlKG4">>,
          <<"NMzYZgyooSvU85qkIUmKuCqgG2AIlvYa2Q/2ctrMhoaHhLOCWWoqYNMaEqPc">>,
@@ -279,15 +257,49 @@ sign_request_test() ->
          <<"IWPZDHSiPcw//AYNgW1CCDptt+UFuaFYbtqZegcBd2n/jzcWODA7zL4KWEUy">>,
          <<"9q4rlh/+1tBReg60QdsmDRsw/cdO1GZrKtuCwbuD4+nbRdVBKv72rqHX9cu0">>,
          <<"utju9jzczCyB+sSAQWrxSsXB/b8vV2qs0l4VD2ML+w==">>
-        ],
+        ]).
 
-    AuthLine = fun(I) -> lists:nth(I, X_OPS_AUTHORIZATION_LINES) end,
+-define(X_OPS_CONTENT_HASH, <<"DFteJZPVv6WKdQmMqZUQUumUyRs=">>).
+
+-define(expected_sign_string,
+        iolist_to_binary(io_lib:format(
+                           "Method:~s\nHashed Path:~s\n"
+                           "X-Ops-Content-Hash:~s\n"
+                           "X-Ops-Timestamp:~s\n"
+                           "X-Ops-UserId:~s",
+                           ["POST", ?hashed_path, ?hashed_body,
+                            ?request_time_iso8601, ?user]))).
+
+hashed_path_test() ->
+    ?assertEqual(?hashed_path, hash_string(canonical_path(?path))).
+
+hashed_body_test() ->
+    ?assertEqual(?hashed_body, hashed_body(?body)).
+
+canonical_time_test() ->
+    % This date format comes from Ruby's default printing,
+    % but doesn't correspond to the HTTP rfc2616 format
+    % Time = "Thu Jan 01 12:00:00 -0000 2009",
+    ?assertEqual(?request_time_iso8601, canonical_time(?request_time_http)).
+    
+canonicalize_request_test() ->
+    Val1 = canonicalize_request(?body, ?user, <<"post">>, ?request_time_iso8601, ?path),
+    ?assertEqual(?expected_sign_string, Val1),
+
+    % verify normalization
+    Val2 = canonicalize_request(?body, ?user, <<"post">>, ?request_time_iso8601,
+                                <<"/organizations//clownco/">>),
+    ?assertEqual(?expected_sign_string, Val2).
+
+sign_request_test() ->
+    {ok, Private_key} = file:read_file("../test/private_key"),
+    AuthLine = fun(I) -> lists:nth(I, ?X_OPS_AUTHORIZATION_LINES) end,
     EXPECTED_SIGN_RESULT =
         [
-         {<<"X-Ops-Content-Hash">>, X_OPS_CONTENT_HASH},
-         {<<"X-Ops-Userid">>, <<"spec-user">>},
+         {<<"X-Ops-Content-Hash">>, ?X_OPS_CONTENT_HASH},
+         {<<"X-Ops-UserId">>, ?user},
          {<<"X-Ops-Sign">>, <<"version=1.0">>},
-         {<<"X-Ops-Timestamp">>, <<"2009-01-01T12:00:00Z">>},
+         {<<"X-Ops-Timestamp">>, ?request_time_iso8601},
          {<<"X-Ops-Authorization-1">>, AuthLine(1)},
          {<<"X-Ops-Authorization-2">>, AuthLine(2)},
          {<<"X-Ops-Authorization-3">>, AuthLine(3)},
@@ -295,25 +307,100 @@ sign_request_test() ->
          {<<"X-Ops-Authorization-5">>, AuthLine(5)},
          {<<"X-Ops-Authorization-6">>, AuthLine(6)}
         ],
-    Time = "Thu, 01 Jan 2009 12:00:00 GMT",
-    Sig = sign_request(PRIVATE_KEY, <<"Spec Body">>, <<"spec-user">>, <<"post">>,
-                       Time, <<"/organizations/clownco">>),
-    ?assertEqual(EXPECTED_SIGN_RESULT, Sig),
-    AuthSig = iolist_to_binary(X_OPS_AUTHORIZATION_LINES),
-    {ok, PUBLIC_KEY} = file:read_file("../test/public_key"),
-        Time = "Thu, 01 Jan 2009 12:00:00 GMT",
-    Time8601 = "2009-01-01T12:00:00Z",
-    User = "spec-user",
-    Hashed_body = "DFteJZPVv6WKdQmMqZUQUumUyRs=",
-    Hashed_path = "YtBWDn1blGGuFIuKksdwXzHU9oE=",
+    Sig = sign_request(Private_key, ?body, ?user, <<"post">>,
+                       ?request_time_http, ?path),
+    ?assertEqual(EXPECTED_SIGN_RESULT, Sig).
 
-    Expected_sign_string = iolist_to_binary(io_lib:format(
-                                              "Method:~s\nHashed Path:~s\n"
-                                              "X-Ops-Content-Hash:~s\n"
-                                              "X-Ops-Timestamp:~s\n"
-                                              "X-Ops-UserId:~s",
-                                              ["POST", Hashed_path, Hashed_body,
-                                               Time8601, User])),
-    ?assertEqual(Expected_sign_string, decrypt_sig(AuthSig, PUBLIC_KEY)).
+decrypt_sig_test() ->
+    AuthSig = iolist_to_binary(?X_OPS_AUTHORIZATION_LINES),
+    {ok, Public_key} = file:read_file("../test/public_key"),
+    ?assertEqual(?expected_sign_string, decrypt_sig(AuthSig, Public_key)).
+
+time_in_bounds_test() ->
+    T1 = {{2011,1,26},{2,3,0}},
+
+    % test seconds
+    T2 = {{2011,1,26},{2,3,4}},
+    ?assertEqual(false, time_in_bounds(T1, T2, 2)),
+    ?assertEqual(true, time_in_bounds(T1, T2, 5)),
+
+    % test minutes
+    T3 = {{2011,1,26},{2,6,0}},
+    ?assertEqual(false, time_in_bounds(T1, T3, 60*2)),
+    ?assertEqual(true, time_in_bounds(T1, T3, 60*5)),
+
+    % test hours
+    T4 = {{2011,1,26},{4,0,0}},
+    ?assertEqual(false, time_in_bounds(T1, T4, 60*60)),
+    ?assertEqual(true, time_in_bounds(T1, T4, 60*60*3)).
+
+make_skew_time() ->
+    % force time skew to allow for now
+    ReqTimeEpoch = calendar:datetime_to_gregorian_seconds(
+                     time_iso8601_to_date_time(?request_time_iso8601)),
+    NowEpoch = calendar:datetime_to_gregorian_seconds(
+                 calendar:now_to_universal_time(erlang:now())),
+    (NowEpoch - ReqTimeEpoch) + 100.
+    
+authenticate_user_request_test_() ->
+    {ok, Private_key} = file:read_file("../test/private_key"),
+    {ok, Public_key} = file:read_file("../test/public_key"),
+    Headers = sign_request(Private_key, ?body, ?user, <<"post">>,
+                           ?request_time_http, ?path),
+    GetHeader = fun(X) -> proplists:get_value(X, Headers) end,
+    % force time skew to allow a request to be processed 'now'
+    TimeSkew = make_skew_time(),
+
+    [
+     {"authenticated user request",
+      fun() ->
+              Ok = authenticate_user_request(GetHeader, <<"post">>, ?path, ?body,
+                                             Public_key, TimeSkew),
+              ?assertEqual({name, ?user}, Ok)
+      end
+     },
+
+     {"no_authn: bad path",
+      fun() ->
+              BadPath = authenticate_user_request(GetHeader, <<"post">>,
+                                                  <<"/organizations/foo">>,
+                                                  ?body, Public_key, TimeSkew),
+              ?assertEqual(no_authn, BadPath)
+      end
+     },
+
+     {"no_authn: bad method",
+      fun() ->
+              BadMethod = authenticate_user_request(GetHeader, <<"PUT">>, ?path,
+                                                    ?body, Public_key, TimeSkew),
+              ?assertEqual(no_authn, BadMethod)
+      end
+     },
+
+     {"no_authn: bad body",
+      fun() ->
+              BadBody = authenticate_user_request(GetHeader, <<"post">>, ?path,
+                                                  <<"xyz">>, Public_key, TimeSkew),
+              ?assertEqual(no_authn, BadBody)
+      end
+     },
+
+     {"no_authn: bad time",
+      fun() ->
+              BadTime = authenticate_user_request(GetHeader, <<"post">>, ?path,
+                                                  ?body, Public_key, 600),
+              ?assertEqual(no_authn, BadTime)
+      end
+      },
+
+     {"no_authn: bad key",
+      fun() ->
+              {ok, Other_key} = file:read_file("../test/other_public_key"),
+              BadKey = authenticate_user_request(GetHeader, <<"post">>, ?path,
+                                                 ?body, Other_key, TimeSkew),
+              ?assertEqual(no_authn, BadKey)
+      end
+      }
+     ].
 
 -endif.

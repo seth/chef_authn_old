@@ -31,6 +31,8 @@
 -type(erlang_time() :: {calendar:date(), calendar:time()}).
 -type(private_key() :: binary()).
 -type(public_key() :: binary()).
+-type(header_name() :: binary()).
+-type(header_value() :: binary() | 'undefined').
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -132,6 +134,7 @@ canonicalize_request(BodyHash, UserId, Method, Time, Path) ->
 %%
 %% Returns a list of header tuples that should be included in the
 %% final HTTP request.
+%%
 sign_request(PrivateKey, Body, User, Method, Time, Path) ->
     {'RSAPrivateKey', Der, _} = hd(public_key:pem_decode(PrivateKey)),
     RSAKey = public_key:der_decode('RSAPrivateKey', Der),
@@ -145,9 +148,14 @@ sign_request(PrivateKey, Body, User, Method, Time, Path) ->
      {<<"X-Ops-Timestamp">>, CTime}]
        ++ sig_header_items(Sig).
 
+%% @doc Generate X-Ops-Authorization-I for use in building auth headers
 xops_header(I) ->
     iolist_to_binary(io_lib:format(<<"X-Ops-Authorization-~B">>, [I])).
 
+%% @doc Given an encrypted signature base64 binary, split it up with
+%% line feeds evry 60 characters and build up a list of
+%% X-Ops-Authorization-i header tuples.
+%%
 sig_header_items(Sig) ->
     % Ruby's Base64.encode64 method inserts line feeds every 60
     % encoded characters.
@@ -155,6 +163,7 @@ sig_header_items(Sig) ->
     [ {xops_header(I), L} ||
         {L, I} <- lists:zip(Lines, lists:seq(1, length(Lines))) ].
 
+%% @doc Split a binary into chunks of size N
 sig_to_list(Sig, N) ->
     lists:reverse(sig_to_list(Sig, N, [])).
 
@@ -168,23 +177,30 @@ sig_to_list(Sig, N, Acc) ->
     end.
 
 -spec(authenticate_user_request(
-        fun((binary()) -> binary()),
+        fun((header_name()) -> header_value()),
         http_method(),
         http_path(),
         http_body(),
         public_key(),
         integer()
        ) -> {name, user_id()} | no_authn).
-%% @doc 
-authenticate_user_request(GetHeader, Method, Path, Body, UserKey, TimeSkew) ->
-
-    % GetHeader is a fun/1 such that GetHeader(binary(), Headers)
-    % returns the value for the header or undefined.
-
+%% @doc Determine if a request is valid
+%%
+%% The `GetHeader' argument is a fun that closes over the request
+%% headers and can be called to obtain the value of a header.  It
+%% should either return the value of the header as binary or
+%% 'undefined'.
+%%
+%% A request signed with a timestamp more than `TimeSkew' seconds from
+%% now will not be authenticated.
+%%
+%% `PublicKey' is a binary containing an RSA public key in PEM format.
+%%
+authenticate_user_request(GetHeader, Method, Path, Body, PublicKey, TimeSkew) ->
     UserId = GetHeader(<<"X-Ops-UserId">>),
     ReqTime = GetHeader(<<"X-Ops-Timestamp">>),
     AuthSig = sig_from_headers(GetHeader, 1, []),
-    Decrypted = decrypt_sig(AuthSig, UserKey),
+    Decrypted = decrypt_sig(AuthSig, PublicKey),
     Plain = canonicalize_request(hashed_body(Body), UserId, Method, ReqTime,
                                  Path),
     SigMatched = try
@@ -230,6 +246,10 @@ time_in_bounds(T1, T2, Skew) ->
     S2 = calendar:datetime_to_gregorian_seconds(T2),
     (S2 - S1) < Skew.
 
+% --
+%% at some point, the functions in the public_key module should be
+%% sufficient, but for now we need the following to read in an RSA
+%% public key.
 read_rsa_public_key(Key) ->
     Bin = erlang:iolist_to_binary(public_key_lines(re:split(Key, "\n"), [])),
     Spki = public_key:der_decode('SubjectPublicKeyInfo', base64:mime_decode(Bin)),
@@ -242,6 +262,7 @@ public_key_lines([<<"-----END PUBLIC KEY-----">>|_Rest], Acc) ->
     lists:reverse(Acc);
 public_key_lines([Line|Rest], Acc) ->
     public_key_lines(Rest, [Line|Acc]).
+
 
 -ifdef(TEST).
 

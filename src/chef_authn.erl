@@ -25,6 +25,7 @@
 -type(user_id() :: binary()).
 -type(http_method() :: binary()).
 -type(http_time() :: binary()).
+-type(iso8601_time() :: binary()).
 -type(http_path() :: binary()).
 -type(sha_hash64() :: binary()).
 -type(erlang_time() :: {calendar:date(), calendar:time()}).
@@ -108,16 +109,19 @@ hashed_body(Body) when is_binary(Body) ->
 hashed_body(Body) when is_list(Body) ->
     hashed_body(iolist_to_binary(Body)).
 
--spec(canonicalize_request(http_body(), user_id(), http_method(),
-                           http_time(), http_path()) -> binary()).
+-spec(canonicalize_request(sha_hash64(), user_id(), http_method(),
+                           iso8601_time(), http_path()) -> binary()).
 %% @doc Canonicalize an HTTP request into a binary that can be signed
 %% for verification.
-canonicalize_request(Body, UserId, Method, Time, Path) ->
+%%
+%% NOTE: this function assumes that `Time' is already in canonical
+%% form (see canonical_time/1).  Other arguments are canonicalized.
+%%
+canonicalize_request(BodyHash, UserId, Method, Time, Path) ->
     Format = <<"Method:~s\nHashed Path:~s\nX-Ops-Content-Hash:~s\nX-Ops-Timestamp:~s\nX-Ops-UserId:~ts">>,
     iolist_to_binary(io_lib:format(Format, [canonical_method(Method),
                                             hash_string(canonical_path(Path)),
-                                            hashed_body(Body),
-                                            %canonical_time(Time),
+                                            BodyHash,
                                             Time,
                                             UserId])).
 
@@ -132,10 +136,10 @@ sign_request(PrivateKey, Body, User, Method, Time, Path) ->
     {'RSAPrivateKey', Der, _} = hd(public_key:pem_decode(PrivateKey)),
     RSAKey = public_key:der_decode('RSAPrivateKey', Der),
     CTime = canonical_time(Time),
-    SignThis = canonicalize_request(Body, User, Method, CTime, Path),
+    HashedBody = hashed_body(Body),
+    SignThis = canonicalize_request(HashedBody, User, Method, CTime, Path),
     Sig = base64:encode(public_key:encrypt_private(SignThis, RSAKey)),
-    % FIXME: should only call hashed_body once
-    [{<<"X-Ops-Content-Hash">>, hashed_body(Body)},
+    [{<<"X-Ops-Content-Hash">>, HashedBody},
      {<<"X-Ops-UserId">>, User},
      {<<"X-Ops-Sign">>, <<"version=1.0">>},
      {<<"X-Ops-Timestamp">>, CTime}]
@@ -181,7 +185,8 @@ authenticate_user_request(GetHeader, Method, Path, Body, UserKey, TimeSkew) ->
     ReqTime = GetHeader(<<"X-Ops-Timestamp">>),
     AuthSig = sig_from_headers(GetHeader, 1, []),
     Decrypted = decrypt_sig(AuthSig, UserKey),
-    Plain = canonicalize_request(Body, UserId, Method, ReqTime, Path),
+    Plain = canonicalize_request(hashed_body(Body), UserId, Method, ReqTime,
+                                 Path),
     SigMatched = try
                      Decrypted = Plain,
                      true
@@ -283,11 +288,11 @@ canonical_time_test() ->
     ?assertEqual(?request_time_iso8601, canonical_time(?request_time_http)).
     
 canonicalize_request_test() ->
-    Val1 = canonicalize_request(?body, ?user, <<"post">>, ?request_time_iso8601, ?path),
+    Val1 = canonicalize_request(?hashed_body, ?user, <<"post">>, ?request_time_iso8601, ?path),
     ?assertEqual(?expected_sign_string, Val1),
 
     % verify normalization
-    Val2 = canonicalize_request(?body, ?user, <<"post">>, ?request_time_iso8601,
+    Val2 = canonicalize_request(?hashed_body, ?user, <<"post">>, ?request_time_iso8601,
                                 <<"/organizations//clownco/">>),
     ?assertEqual(?expected_sign_string, Val2).
 

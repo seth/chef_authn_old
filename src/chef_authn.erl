@@ -19,7 +19,14 @@
 
 -define(buf_size, 16384).
 
--compile([export_all]).
+-export([
+         hash_string/1,
+         hash_file/1,
+         sign_request/6,
+         authenticate_user_request/6
+         ]).
+
+%%-compile([export_all]).
 
 -type(http_body() :: binary() | pid()).
 -type(user_id() :: binary()).

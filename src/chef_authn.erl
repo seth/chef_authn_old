@@ -126,6 +126,12 @@ hashed_body(Body) when is_list(Body) ->
 %% NOTE: this function assumes that `Time' is already in canonical
 %% form (see canonical_time/1).  Other arguments are canonicalized.
 %%
+canonicalize_request(_BodyHash, _UserId, _Method, undefined, _Path) ->
+    undefined_time;
+canonicalize_request(_BodyHash, undefined, _Method, _Time, _Path) ->
+    undefined_user;
+canonicalize_request(undefined, _UserId, _Method, _Time, _Path) ->
+    undefined_body_hash;
 canonicalize_request(BodyHash, UserId, Method, Time, Path) ->
     Format = <<"Method:~s\nHashed Path:~s\nX-Ops-Content-Hash:~s\nX-Ops-Timestamp:~s\nX-Ops-UserId:~ts">>,
     iolist_to_binary(io_lib:format(Format, [canonical_method(Method),
@@ -244,6 +250,8 @@ sig_from_headers(GetHeader, I, Acc) ->
             sig_from_headers(GetHeader, I+1, [Part|Acc])
     end.
 
+time_in_bounds(undefined, _Skew) ->
+    false;
 time_in_bounds(ReqTime, Skew) ->
     Now = calendar:now_to_universal_time(erlang:now()),
     time_in_bounds(time_iso8601_to_date_time(ReqTime), Now, Skew).
@@ -433,7 +441,56 @@ authenticate_user_request_test_() ->
                                                  ?body, Other_key, TimeSkew),
               ?assertEqual(no_authn, BadKey)
       end
-      }
+      },
+
+     {"no_authn: missing timestamp header",
+      fun() ->
+              Headers2 = proplists:delete(<<"X-Ops-Timestamp">>, Headers),
+              GetHeader2 = fun(X) -> proplists:get_value(X, Headers2) end,
+              ?assertEqual(no_authn,
+                           authenticate_user_request(GetHeader2, <<"post">>, ?path,
+                                                     ?body, Public_key, TimeSkew))
+      end
+     },
+
+     {"no_authn: missing user header",
+      fun() ->
+              Headers2 = proplists:delete(<<"X-Ops-UserId">>, Headers),
+              GetHeader2 = fun(X) -> proplists:get_value(X, Headers2) end,
+              ?assertEqual(no_authn,
+                           authenticate_user_request(GetHeader2, <<"post">>, ?path,
+                                                     ?body, Public_key, TimeSkew))
+      end
+     },
+
+     {"no_authn: missing all authorization-i headers",
+      fun() ->
+              Headers2 = lists:filter(
+                           fun({<<"X-Ops-Authorization-", _/binary>>, _}) -> false;
+                              (_Else) -> true
+                           end, Headers),
+              GetHeader2 = fun(X) -> proplists:get_value(X, Headers2) end,
+              ?assertEqual(no_authn,
+                           authenticate_user_request(GetHeader2, <<"post">>, ?path,
+                                                     ?body, Public_key, TimeSkew))
+      end
+     },
+
+     {"no_authn: missing one authorization-i header",
+      fun() ->
+              Headers2 = lists:filter(
+                           fun({<<"X-Ops-Authorization-5", _/binary>>, _}) -> false;
+                              (_Else) -> true
+                           end, Headers),
+              GetHeader2 = fun(X) -> proplists:get_value(X, Headers2) end,
+              ?assertEqual(no_authn,
+                           authenticate_user_request(GetHeader2, <<"post">>, ?path,
+                                                     ?body, Public_key, TimeSkew))
+      end
+     }
+
+
+
      ].
 
 -endif.

@@ -1,4 +1,12 @@
-* chef_authn, an Erlang port of Chef's mixlib-authentication
+* =chef_authn=, Chef request authentication and verification in Erlang
+
+=chef_authn= is an Erlang port of the [mixlib-authentication][1] gem
+used for generating and verifying authentication HTTP headers for use
+with [Chef][2].
+
+[1] https://github.com/opscode/mixlib-authentication
+[2] http://www.opscode/chef/
+
 ** Making RSA keys with openssl
 : openssl genrsa -out akey.pem 1024
 : openssl rsa -in akey.pem -pubout > akey_public.pem

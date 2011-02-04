@@ -1,7 +1,7 @@
 -module(chef_authn).
 %
-% Author:: Seth Falcon (<seth@opscode.com>)
-% Copyright:: Copyright 2010 Opscode, Inc.
+% @author Seth Falcon <seth@opscode.com>
+% @copyright Copyright 2011 Opscode, Inc.
 % License:: Apache License, Version 2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");

@@ -28,6 +28,7 @@
          authenticate_user_request/6
          ]).
 
+-include_lib("public_key/include/public_key.hrl").
 %%-compile([export_all]).
 
 -type(http_body() :: binary() | pid()).
@@ -237,8 +238,8 @@ authenticate_user_request(GetHeader, Method, Path, Body, PublicKey, TimeSkew) ->
     end.
 
 -spec(decrypt_sig(binary(), binary()) -> binary() | decrypt_failed).
-decrypt_sig(Sig, PublicKey) ->
-    PK = read_rsa_public_key(PublicKey),
+decrypt_sig(Sig, PublicCert) ->
+    PK = read_cert(PublicCert),
     try
         public_key:decrypt_public(base64:decode(Sig), PK)
     catch
@@ -272,23 +273,29 @@ parse_signing_description(Desc) ->
     [ {Key, Value} ||
         [Key, Value] <- [ re:split(KV, "=") || KV <- re:split(Desc, ";") ] ].
 
-% --
-%% at some point, the functions in the public_key module should be
-%% sufficient, but for now we need the following to read in an RSA
-%% public key.
-read_rsa_public_key(Key) ->
-    Bin = erlang:iolist_to_binary(public_key_lines(re:split(Key, "\n"), [])),
-    Spki = public_key:der_decode('SubjectPublicKeyInfo', base64:mime_decode(Bin)),
-    {_, _, {0, KeyDer}} = Spki,
+% % --
+% %% at some point, the functions in the public_key module should be
+% %% sufficient, but for now we need the following to read in an RSA
+% %% public key.
+% read_rsa_public_key(Key) ->
+%     Bin = erlang:iolist_to_binary(public_key_lines(re:split(Key, "\n"), [])),
+%     Spki = public_key:der_decode('SubjectPublicKeyInfo', base64:mime_decode(Bin)),
+%     {_, _, {0, KeyDer}} = Spki,
+%     public_key:der_decode('RSAPublicKey', KeyDer).
+
+% public_key_lines([<<"-----BEGIN PUBLIC KEY-----">>|Rest], Acc) ->
+%     public_key_lines(Rest, Acc);
+% public_key_lines([<<"-----END PUBLIC KEY-----">>|_Rest], Acc) ->
+%     lists:reverse(Acc);
+% public_key_lines([Line|Rest], Acc) ->
+%     public_key_lines(Rest, [Line|Acc]).
+
+read_cert(Bin) when is_binary(Bin) ->
+    Cert = public_key:pem_entry_decode(hd(public_key:pem_decode(Bin))),
+    TbsCert = Cert#'Certificate'.tbsCertificate,
+    Spki = TbsCert#'TBSCertificate'.subjectPublicKeyInfo,
+    {0, KeyDer} = Spki#'SubjectPublicKeyInfo'.subjectPublicKey,
     public_key:der_decode('RSAPublicKey', KeyDer).
-
-public_key_lines([<<"-----BEGIN PUBLIC KEY-----">>|Rest], Acc) ->
-    public_key_lines(Rest, Acc);
-public_key_lines([<<"-----END PUBLIC KEY-----">>|_Rest], Acc) ->
-    lists:reverse(Acc);
-public_key_lines([Line|Rest], Acc) ->
-    public_key_lines(Rest, [Line|Acc]).
-
 
 -ifdef(TEST).
 
@@ -365,7 +372,7 @@ sign_request_test() ->
 
 decrypt_sig_test() ->
     AuthSig = iolist_to_binary(?X_OPS_AUTHORIZATION_LINES),
-    {ok, Public_key} = file:read_file("../test/public_key"),
+    {ok, Public_key} = file:read_file("../test/example_cert.pem"),
     ?assertEqual(?expected_sign_string, decrypt_sig(AuthSig, Public_key)).
 
 time_in_bounds_test() ->
@@ -396,7 +403,7 @@ make_skew_time() ->
     
 authenticate_user_request_test_() ->
     {ok, Private_key} = file:read_file("../test/private_key"),
-    {ok, Public_key} = file:read_file("../test/public_key"),
+    {ok, Public_key} = file:read_file("../test/example_cert.pem"),
     Headers = sign_request(Private_key, ?body, ?user, <<"post">>,
                            ?request_time_http, ?path),
     GetHeader = fun(X) -> proplists:get_value(X, Headers) end,
@@ -447,7 +454,7 @@ authenticate_user_request_test_() ->
 
      {"no_authn: bad key",
       fun() ->
-              {ok, Other_key} = file:read_file("../test/other_public_key"),
+              {ok, Other_key} = file:read_file("../test/other_cert.pem"),
               BadKey = authenticate_user_request(GetHeader, <<"post">>, ?path,
                                                  ?body, Other_key, TimeSkew),
               ?assertEqual(no_authn, BadKey)
@@ -529,5 +536,10 @@ parse_signing_description_test_() ->
              {<<"a=1;b=2">>, [{<<"a">>, <<"1">>}, {<<"b">>, <<"2">>}]}],
     [ ?_assertEqual(Want, parse_signing_description(In))
       || {In, Want} <- Cases ].
+
+read_cert_test() ->
+    {ok, Bin} = file:read_file("../test/example_cert.pem"),
+    Cert = read_cert(Bin),
+    ?assertEqual('RSAPublicKey', erlang:element(1, Cert)).
 
 -endif.

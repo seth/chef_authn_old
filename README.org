@@ -7,3 +7,9 @@ with [[http://www.opscode/chef/][Chef]].
 ** Making RSA keys with openssl
 : openssl genrsa -out akey.pem 1024
 : openssl rsa -in akey.pem -pubout > akey_public.pem
+
+And this is how to generate a certificate given an existing RSA
+private key:
+: openssl req \
+:  -x509 -nodes -days 365 \
+:  -key private_key -keyform pem -new -keyout mycert.pem -out mycert.pem

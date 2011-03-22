@@ -7,6 +7,5 @@
                   kernel,
                   stdlib
                  ]},
-  {mod, { chef_authn_app, []}},
   {env, []}
  ]}.

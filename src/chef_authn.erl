@@ -1,7 +1,4 @@
--module(chef_authn).
 %
-% @author Seth Falcon <seth@opscode.com>
-% @copyright Copyright 2011 Opscode, Inc.
 % License:: Apache License, Version 2.0
 %
 % Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +13,19 @@
 % See the License for the specific language governing permissions and
 % limitations under the License.
 %
+% @author Seth Falcon <seth@opscode.com>
+% @copyright Copyright 2011 Opscode, Inc.
+% @version 0.0.2
+% @end
+
+% @doc chef_authn - Request signing and authentication for Opscode Chef
+%
+% This module is an Erlang port of the mixlib-authentication Ruby gem.
+% It can be used to sign HTTP requests to send to a Chef server or to
+% validate such requests (for server implementation).
+%
+%
+-module(chef_authn).
 
 -define(buf_size, 16384).
 -define(signing_version, <<"1.0">>).
@@ -29,7 +39,6 @@
          ]).
 
 -include_lib("public_key/include/public_key.hrl").
-%%-compile([export_all]).
 
 -type(http_body() :: binary() | pid()).
 -type(user_id() :: binary()).

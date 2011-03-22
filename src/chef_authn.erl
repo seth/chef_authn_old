@@ -31,6 +31,14 @@
 -define(signing_version, <<"1.0">>).
 -define(signing_version_key, <<"version">>).
 
+-define(required_headers, [<<"X-Ops-UserId">>,
+                           <<"X-Ops-Timestamp">>,
+                           <<"X-Ops-Sign">>,
+                           % FIXME: mixlib-authorization requires host, but
+                           % it is not used as part of the signing protocol AFAICT
+                           % <<"host">>,
+                           <<"X-Ops-Content-Hash">>]).
+
 -export([
          hash_string/1,
          hash_file/1,
@@ -201,6 +209,39 @@ sig_to_list(Sig, N, Acc) ->
             sig_to_list(Rest, N, [Line|Acc])
     end.
 
+-spec(validate_headers(fun((header_name()) -> header_value())) ->
+             'ok' | no_return()).
+%% @doc Validate that all required headers are present
+%%
+%% Returns 'ok' if all required headers are present.  Otherwise, throws
+%% `{missing, [header_name()]}' providing a list of the
+%% missing headers in the exception.
+%%
+%% @throws {missing, [binary()]}
+%%
+validate_headers(GetHeader) ->
+    Missing = [ H || H <- ?required_headers, GetHeader(H) == undefined ],
+    case Missing of
+        [] -> ok;
+        TheList -> throw({missing_headers, TheList})
+    end.
+
+validate_time_in_bounds(GetHeader, TimeSkew) ->
+    ReqTime = GetHeader(<<"X-Ops-Timestamp">>),
+    case time_in_bounds(ReqTime, TimeSkew) of
+        true -> ok;
+        false -> throw(bad_clock)
+    end.
+
+validate_sign_description(GetHeader) ->
+    SignDesc = parse_signing_description(GetHeader(<<"X-Ops-Sign">>)),
+    SignVersion = proplists:get_value(?signing_version_key, SignDesc),
+    try
+        ?signing_version = SignVersion
+    catch
+        error:{badmatch, _} -> throw(bad_sign_desc)
+    end.
+
 -spec(authenticate_user_request(
         fun((header_name()) -> header_value()),
         http_method(),
@@ -208,7 +249,7 @@ sig_to_list(Sig, N, Acc) ->
         http_body(),
         public_key(),
         integer()
-       ) -> {name, user_id()} | no_authn).
+       ) -> {name, user_id()} | {no_authn, Reason::term()}).
 %% @doc Determine if a request is valid
 %%
 %% The `GetHeader' argument is a fun that closes over the request
@@ -222,28 +263,29 @@ sig_to_list(Sig, N, Acc) ->
 %% `PublicKey' is a binary containing an RSA public key in PEM format.
 %%
 authenticate_user_request(GetHeader, Method, Path, Body, PublicKey, TimeSkew) ->
+    try
+        validate_headers(GetHeader),
+        validate_time_in_bounds(GetHeader, TimeSkew),
+        validate_sign_description(GetHeader),
+        do_authenticate_user_request(GetHeader, Method, Path, Body, PublicKey)
+    catch
+        throw:Why -> {no_authn, Why}
+    end.
+                
+do_authenticate_user_request(GetHeader, Method, Path, Body, PublicKey) ->
+    % NOTE: signing description validation and time_skew validation
+    % are done in the wrapper function.
     UserId = GetHeader(<<"X-Ops-UserId">>),
     ReqTime = GetHeader(<<"X-Ops-Timestamp">>),
-    SignDesc = parse_signing_description(GetHeader(<<"X-Ops-Sign">>)),
-    SignVersion = proplists:get_value(?signing_version_key, SignDesc),
     AuthSig = sig_from_headers(GetHeader, 1, []),
     Decrypted = decrypt_sig(AuthSig, PublicKey),
     Plain = canonicalize_request(hashed_body(Body), UserId, Method, ReqTime,
                                  Path),
-    SigMatched = try
-                     Decrypted = Plain,
-                     ?signing_version = SignVersion,
-                     true
-                 catch
-                     error:{badmatch, _} ->
-                         false
-                 end,
-    TimeInBounds = time_in_bounds(ReqTime, TimeSkew),
-    case SigMatched andalso TimeInBounds of
-        true ->
-            {name, UserId};
-        false ->
-            no_authn
+    try
+        Decrypted = Plain,
+        {name, UserId}
+    catch
+        error:{badmatch, _} -> {no_authn, bad_sig}
     end.
 
 -spec(decrypt_sig(binary(), binary()) -> binary() | decrypt_failed).
@@ -433,7 +475,7 @@ authenticate_user_request_test_() ->
               BadPath = authenticate_user_request(GetHeader, <<"post">>,
                                                   <<"/organizations/foo">>,
                                                   ?body, Public_key, TimeSkew),
-              ?assertEqual(no_authn, BadPath)
+              ?assertEqual({no_authn, bad_sig}, BadPath)
       end
      },
 
@@ -441,7 +483,7 @@ authenticate_user_request_test_() ->
       fun() ->
               BadMethod = authenticate_user_request(GetHeader, <<"PUT">>, ?path,
                                                     ?body, Public_key, TimeSkew),
-              ?assertEqual(no_authn, BadMethod)
+              ?assertEqual({no_authn, bad_sig}, BadMethod)
       end
      },
 
@@ -449,7 +491,7 @@ authenticate_user_request_test_() ->
       fun() ->
               BadBody = authenticate_user_request(GetHeader, <<"post">>, ?path,
                                                   <<"xyz">>, Public_key, TimeSkew),
-              ?assertEqual(no_authn, BadBody)
+              ?assertEqual({no_authn, bad_sig}, BadBody)
       end
      },
 
@@ -457,7 +499,7 @@ authenticate_user_request_test_() ->
       fun() ->
               BadTime = authenticate_user_request(GetHeader, <<"post">>, ?path,
                                                   ?body, Public_key, 600),
-              ?assertEqual(no_authn, BadTime)
+              ?assertEqual({no_authn, bad_clock}, BadTime)
       end
       },
 
@@ -466,7 +508,7 @@ authenticate_user_request_test_() ->
               {ok, Other_key} = file:read_file("../test/other_cert.pem"),
               BadKey = authenticate_user_request(GetHeader, <<"post">>, ?path,
                                                  ?body, Other_key, TimeSkew),
-              ?assertEqual(no_authn, BadKey)
+              ?assertEqual({no_authn, bad_sig}, BadKey)
       end
       },
 
@@ -474,7 +516,7 @@ authenticate_user_request_test_() ->
       fun() ->
               Headers2 = proplists:delete(<<"X-Ops-Timestamp">>, Headers),
               GetHeader2 = fun(X) -> proplists:get_value(X, Headers2) end,
-              ?assertEqual(no_authn,
+              ?assertEqual({no_authn, {missing_headers, [<<"X-Ops-Timestamp">>]}},
                            authenticate_user_request(GetHeader2, <<"post">>, ?path,
                                                      ?body, Public_key, TimeSkew))
       end
@@ -484,7 +526,7 @@ authenticate_user_request_test_() ->
       fun() ->
               Headers2 = proplists:delete(<<"X-Ops-UserId">>, Headers),
               GetHeader2 = fun(X) -> proplists:get_value(X, Headers2) end,
-              ?assertEqual(no_authn,
+              ?assertEqual({no_authn, {missing_headers, [<<"X-Ops-UserId">>]}},
                            authenticate_user_request(GetHeader2, <<"post">>, ?path,
                                                      ?body, Public_key, TimeSkew))
       end
@@ -497,7 +539,7 @@ authenticate_user_request_test_() ->
                               (_Else) -> true
                            end, Headers),
               GetHeader2 = fun(X) -> proplists:get_value(X, Headers2) end,
-              ?assertEqual(no_authn,
+              ?assertEqual({no_authn, bad_sig},
                            authenticate_user_request(GetHeader2, <<"post">>, ?path,
                                                      ?body, Public_key, TimeSkew))
       end
@@ -510,7 +552,7 @@ authenticate_user_request_test_() ->
                               (_Else) -> true
                            end, Headers),
               GetHeader2 = fun(X) -> proplists:get_value(X, Headers2) end,
-              ?assertEqual(no_authn,
+              ?assertEqual({no_authn, bad_sig},
                            authenticate_user_request(GetHeader2, <<"post">>, ?path,
                                                      ?body, Public_key, TimeSkew))
       end
@@ -521,7 +563,7 @@ authenticate_user_request_test_() ->
               Headers2 = lists:keyreplace(<<"X-Ops-Sign">>, 1, Headers,
                                           {<<"X-Ops-Sign">>, <<"version=2.0">>}),
               GetHeader2 = fun(X) -> proplists:get_value(X, Headers2) end,
-              ?assertEqual(no_authn,
+              ?assertEqual({no_authn, bad_sign_desc},
                            authenticate_user_request(GetHeader2, <<"post">>, ?path,
                                                      ?body, Public_key, TimeSkew))
       end
@@ -531,13 +573,28 @@ authenticate_user_request_test_() ->
       fun() ->
               Headers2 = lists:keydelete(<<"X-Ops-Sign">>, 1, Headers),
               GetHeader2 = fun(X) -> proplists:get_value(X, Headers2) end,
-              ?assertEqual(no_authn,
-                           authenticate_user_request(GetHeader2, <<"post">>, ?path,
-                                                     ?body, Public_key, TimeSkew))
+              ?assertEqual({no_authn, {missing_headers, [<<"X-Ops-Sign">>]}},
+                            authenticate_user_request(GetHeader2, <<"post">>, ?path,
+                                                      ?body, Public_key, TimeSkew))
       end
      }
-
      ].
+
+validate_headers_test_() ->
+    {ok, Private_key} = file:read_file("../test/private_key"),
+    Headers = sign_request(Private_key, ?body, ?user, <<"post">>,
+                           ?request_time_http, ?path),
+    GetHeader = fun(X) -> proplists:get_value(X, Headers) end,
+    MissingOneTests =
+        [ fun() ->
+                  Headers2 = proplists:delete(H, Headers),
+                  GetHeader2 = fun(X) -> proplists:get_value(X, Headers2) end,
+                  ?assertThrow({missing_headers, [H]}, validate_headers(GetHeader2))
+          end || H <- ?required_headers ],
+    [?_assertEqual(ok, validate_headers(GetHeader)),
+     ?_assertThrow({missing_headers, ?required_headers},
+                   validate_headers(fun(_X) -> undefined end)) ]
+        ++ MissingOneTests.
 
 parse_signing_description_test_() ->
     Cases = [{<<"version=1.0">>, [{<<"version">>, <<"1.0">>}]},

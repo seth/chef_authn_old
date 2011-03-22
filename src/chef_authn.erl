@@ -138,8 +138,11 @@ hashed_body(Body) when is_binary(Body) ->
 hashed_body(Body) when is_list(Body) ->
     hashed_body(iolist_to_binary(Body)).
 
--spec(canonicalize_request(sha_hash64(), user_id(), http_method(),
-                           iso8601_time(), http_path()) -> binary()).
+-spec(canonicalize_request(sha_hash64() | undefined,
+                           user_id() | undefined,
+                           http_method(),
+                           iso8601_time() | undefined,
+                           http_path()) -> binary()).
 %% @doc Canonicalize an HTTP request into a binary that can be signed
 %% for verification.
 %%

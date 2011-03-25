@@ -138,23 +138,19 @@ hashed_body(Body) when is_binary(Body) ->
 hashed_body(Body) when is_list(Body) ->
     hashed_body(iolist_to_binary(Body)).
 
--spec(canonicalize_request(sha_hash64() | undefined,
-                           user_id() | undefined,
-                           http_method(),
-                           iso8601_time() | undefined,
-                           http_path()) -> binary()).
+-spec(canonicalize_request(sha_hash64(), user_id(), http_method(), iso8601_time(), http_path())
+      -> binary()).
 %% @doc Canonicalize an HTTP request into a binary that can be signed
 %% for verification.
 %%
 %% NOTE: this function assumes that `Time' is already in canonical
 %% form (see canonical_time/1).  Other arguments are canonicalized.
 %%
-canonicalize_request(_BodyHash, _UserId, _Method, undefined, _Path) ->
-    undefined_time;
-canonicalize_request(_BodyHash, undefined, _Method, _Time, _Path) ->
-    undefined_user;
-canonicalize_request(undefined, _UserId, _Method, _Time, _Path) ->
-    undefined_body_hash;
+canonicalize_request(BodyHash, UserId, _Method, Time, _Path)
+  when BodyHash == undefined orelse
+         UserId == undefined orelse
+           Time == undefined ->
+    undefined;
 canonicalize_request(BodyHash, UserId, Method, Time, Path) ->
     Format = <<"Method:~s\nHashed Path:~s\nX-Ops-Content-Hash:~s\nX-Ops-Timestamp:~s\nX-Ops-UserId:~ts">>,
     iolist_to_binary(io_lib:format(Format, [canonical_method(Method),

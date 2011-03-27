@@ -43,23 +43,28 @@
          hash_string/1,
          hash_file/1,
          sign_request/6,
-         authenticate_user_request/6
+         authenticate_user_request/6,
+         validate_headers/1,
+         validate_time_in_bounds/2,
+         validate_sign_description/1
          ]).
 
 -include_lib("public_key/include/public_key.hrl").
 
--type(http_body() :: binary() | pid()).
--type(user_id() :: binary()).
--type(http_method() :: binary()).
--type(http_time() :: binary()).
--type(iso8601_time() :: binary()).
--type(http_path() :: binary()).
--type(sha_hash64() :: binary()).
--type(erlang_time() :: {calendar:date(), calendar:time()}).
--type(private_key() :: binary()).
--type(public_key() :: binary()).
--type(header_name() :: binary()).
--type(header_value() :: binary() | 'undefined').
+-type http_body() :: binary() | pid().
+-type user_id() :: binary().
+-type http_method() :: binary().
+-type http_time() :: binary().
+-type iso8601_time() :: binary().
+-type http_path() :: binary().
+-type sha_hash64() :: binary().
+-type erlang_time() :: {calendar:date(), calendar:time()}.
+-type private_key() :: binary().
+-type public_key() :: binary().
+-type header_name() :: binary().
+-type header_value() :: binary() | 'undefined'.
+-type header_fun() :: fun((header_name()) -> header_value()).
+-type time_skew() :: non_neg_integer().
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -147,9 +152,9 @@ hashed_body(Body) when is_list(Body) ->
 %% form (see canonical_time/1).  Other arguments are canonicalized.
 %%
 canonicalize_request(BodyHash, UserId, _Method, Time, _Path)
-  when BodyHash == undefined orelse
-         UserId == undefined orelse
-           Time == undefined ->
+  when BodyHash =:= undefined orelse
+         UserId =:= undefined orelse
+           Time =:= undefined ->
     undefined;
 canonicalize_request(BodyHash, UserId, Method, Time, Path) ->
     Format = <<"Method:~s\nHashed Path:~s\nX-Ops-Content-Hash:~s\nX-Ops-Timestamp:~s\nX-Ops-UserId:~ts">>,
@@ -159,14 +164,14 @@ canonicalize_request(BodyHash, UserId, Method, Time, Path) ->
                                             Time,
                                             UserId])).
 
--spec(sign_request(private_key(), http_body(), user_id(),
-                   http_method(), http_time(),
-                   http_path()) -> [{binary(), binary()}]).
 %% @doc Sign an HTTP request so it can be sent to a Chef server.
 %%
 %% Returns a list of header tuples that should be included in the
 %% final HTTP request.
 %%
+-spec sign_request(private_key(), http_body(), user_id(), http_method(),
+                   http_time(), http_path()) ->
+    [{binary(), binary()}].
 sign_request(PrivateKey, Body, User, Method, Time, Path) ->
     {'RSAPrivateKey', Der, _} = hd(public_key:pem_decode(PrivateKey)),
     RSAKey = public_key:der_decode('RSAPrivateKey', Der),
@@ -181,6 +186,7 @@ sign_request(PrivateKey, Body, User, Method, Time, Path) ->
        ++ sig_header_items(Sig).
 
 %% @doc Generate X-Ops-Authorization-I for use in building auth headers
+-spec xops_header(non_neg_integer()) -> header_name().
 xops_header(I) ->
     iolist_to_binary(io_lib:format(<<"X-Ops-Authorization-~B">>, [I])).
 
@@ -208,8 +214,6 @@ sig_to_list(Sig, N, Acc) ->
             sig_to_list(Rest, N, [Line|Acc])
     end.
 
--spec(validate_headers(fun((header_name()) -> header_value())) ->
-             'ok' | no_return()).
 %% @doc Validate that all required headers are present
 %%
 %% Returns 'ok' if all required headers are present.  Otherwise, throws
@@ -218,6 +222,7 @@ sig_to_list(Sig, N, Acc) ->
 %%
 %% @throws {missing, [binary()]}
 %%
+-spec validate_headers(header_fun()) -> 'ok' | no_return().
 validate_headers(GetHeader) ->
     Missing = [ H || H <- ?required_headers, GetHeader(H) == undefined ],
     case Missing of
@@ -225,6 +230,14 @@ validate_headers(GetHeader) ->
         TheList -> throw({missing_headers, TheList})
     end.
 
+%% @doc Validate that the request time is within `TimeSkew' seconds of now.
+%%
+%% Returns 'ok' if request time in the X-Ops-Timestamp header is
+%% wihtin bounds.  Otherwise, throws `bad_clock'
+%%
+%% @throws bad_clock
+%%
+-spec validate_time_in_bounds(header_fun(), time_skew()) -> 'ok' | no_return().
 validate_time_in_bounds(GetHeader, TimeSkew) ->
     ReqTime = GetHeader(<<"X-Ops-Timestamp">>),
     case time_in_bounds(ReqTime, TimeSkew) of
@@ -232,23 +245,24 @@ validate_time_in_bounds(GetHeader, TimeSkew) ->
         false -> throw(bad_clock)
     end.
 
+%% @doc Validate that the X-Ops-Sign header describes a supported signing format.
+%%
+%% Returns 'ok' if the signing format is supported.  Otherwise, throws
+%% `bad_sign_desc'
+%%
+%% @throws bad_sign_desc
+%%
+-spec validate_sign_description(header_fun()) -> 'ok' | no_return().
 validate_sign_description(GetHeader) ->
     SignDesc = parse_signing_description(GetHeader(<<"X-Ops-Sign">>)),
     SignVersion = proplists:get_value(?signing_version_key, SignDesc),
     try
-        ?signing_version = SignVersion
+        ?signing_version = SignVersion,
+        ok
     catch
         error:{badmatch, _} -> throw(bad_sign_desc)
     end.
 
--spec(authenticate_user_request(
-        fun((header_name()) -> header_value()),
-        http_method(),
-        http_path(),
-        http_body(),
-        public_key(),
-        integer()
-       ) -> {name, user_id()} | {no_authn, Reason::term()}).
 %% @doc Determine if a request is valid
 %%
 %% The `GetHeader' argument is a fun that closes over the request
@@ -261,6 +275,13 @@ validate_sign_description(GetHeader) ->
 %%
 %% `PublicKey' is a binary containing an RSA public key in PEM format.
 %%
+-spec authenticate_user_request(fun((header_name()) -> header_value()),
+                                   http_method(),
+                                   http_path(),
+                                   http_body(),
+                                   public_key(),
+                                   time_skew()) ->
+    {name, user_id()} | {no_authn, Reason::term()}.
 authenticate_user_request(GetHeader, Method, Path, Body, PublicKey, TimeSkew) ->
     try
         validate_headers(GetHeader),
@@ -287,7 +308,7 @@ do_authenticate_user_request(GetHeader, Method, Path, Body, PublicKey) ->
         error:{badmatch, _} -> {no_authn, bad_sig}
     end.
 
--spec(decrypt_sig(binary(), binary()) -> binary() | decrypt_failed).
+-spec decrypt_sig(binary(), binary()) -> binary() | decrypt_failed.
 decrypt_sig(Sig, PublicCert) ->
     PK = read_cert(PublicCert),
     try

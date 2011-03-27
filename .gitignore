@@ -1,3 +1,4 @@
 .eunit
 *.beam
 doc/*
+/ebin/chef_authn.app

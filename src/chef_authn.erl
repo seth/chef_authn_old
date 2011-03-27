@@ -44,9 +44,7 @@
          hash_file/1,
          sign_request/6,
          authenticate_user_request/6,
-         validate_headers/1,
-         validate_time_in_bounds/2,
-         validate_sign_description/1
+         validate_headers/2
          ]).
 
 -include_lib("public_key/include/public_key.hrl").
@@ -220,13 +218,15 @@ sig_to_list(Sig, N, Acc) ->
 %% `{missing, [header_name()]}' providing a list of the
 %% missing headers in the exception.
 %%
-%% @throws {missing, [binary()]}
+%% @throws {missing, [binary()]} | bad_clock | bad_sign_desc
 %%
--spec validate_headers(header_fun()) -> 'ok' | no_return().
-validate_headers(GetHeader) ->
+-spec validate_headers(header_fun(), time_skew()) -> 'ok' | no_return().
+validate_headers(GetHeader, TimeSkew) ->
     Missing = [ H || H <- ?required_headers, GetHeader(H) == undefined ],
     case Missing of
-        [] -> ok;
+        [] ->
+            validate_time_in_bounds(GetHeader, TimeSkew),
+            validate_sign_description(GetHeader);
         TheList -> throw({missing_headers, TheList})
     end.
 
@@ -284,14 +284,12 @@ validate_sign_description(GetHeader) ->
     {name, user_id()} | {no_authn, Reason::term()}.
 authenticate_user_request(GetHeader, Method, Path, Body, PublicKey, TimeSkew) ->
     try
-        validate_headers(GetHeader),
-        validate_time_in_bounds(GetHeader, TimeSkew),
-        validate_sign_description(GetHeader),
+        validate_headers(GetHeader, TimeSkew),
         do_authenticate_user_request(GetHeader, Method, Path, Body, PublicKey)
     catch
         throw:Why -> {no_authn, Why}
     end.
-                
+
 do_authenticate_user_request(GetHeader, Method, Path, Body, PublicKey) ->
     % NOTE: signing description validation and time_skew validation
     % are done in the wrapper function.
@@ -603,17 +601,17 @@ authenticate_user_request_test_() ->
 validate_headers_test_() ->
     {ok, Private_key} = file:read_file("../test/private_key"),
     Headers = sign_request(Private_key, ?body, ?user, <<"post">>,
-                           ?request_time_http, ?path),
+                           httpd_util:rfc1123_date(), ?path),
     GetHeader = fun(X) -> proplists:get_value(X, Headers) end,
     MissingOneTests =
         [ fun() ->
                   Headers2 = proplists:delete(H, Headers),
                   GetHeader2 = fun(X) -> proplists:get_value(X, Headers2) end,
-                  ?assertThrow({missing_headers, [H]}, validate_headers(GetHeader2))
+                  ?assertThrow({missing_headers, [H]}, validate_headers(GetHeader2, 10))
           end || H <- ?required_headers ],
-    [?_assertEqual(ok, validate_headers(GetHeader)),
+    [?_assertEqual(ok, validate_headers(GetHeader, 1)),
      ?_assertThrow({missing_headers, ?required_headers},
-                   validate_headers(fun(_X) -> undefined end)) ]
+                   validate_headers(fun(_X) -> undefined end, 0)) ]
         ++ MissingOneTests.
 
 parse_signing_description_test_() ->
